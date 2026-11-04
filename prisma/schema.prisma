@@ -1,0 +1,1359 @@
+// Prisma Schema – RDEvolution CRM
+// Phase 1: nur Foundation-Models (Auth, Audit). CRM-Fachmodule folgen ab Phase 2.
+
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+enum UserRole {
+  OWNER
+  ADMIN
+  USER
+
+  @@map("user_role")
+}
+
+enum AuditActorType {
+  USER
+  SYSTEM
+
+  @@map("audit_actor_type")
+}
+
+// Credentials-Login mit JWT-Session-Strategie (Auth.js) – kein Adapter,
+// daher keine Account/Session/VerificationToken-Models nötig.
+// Rate-Limiting für fehlgeschlagene Logins liegt bewusst NICHT hier, sondern
+// in LoginRateLimit (siehe dort) – u. a. weil nicht existierende E-Mail-Adressen
+// keinen User-Datensatz besitzen, über den begrenzt werden könnte.
+model User {
+  uploadedFiles    FileAttachment[] @relation("FileUploader")
+  reminders        Reminder[]
+  assignedInvoices Invoice[]        @relation("InvoiceAssignedUser")
+  createdInvoices  Invoice[]        @relation("InvoiceCreatedBy")
+  assignedQuotes   Quote[]          @relation("QuoteAssignedUser")
+  createdQuotes    Quote[]          @relation("QuoteCreatedBy")
+  id               String           @id @default(cuid())
+  email            String           @unique
+  passwordHash     String           @map("password_hash")
+  firstName        String           @map("first_name")
+  lastName         String           @map("last_name")
+  role             UserRole         @default(USER)
+  isActive         Boolean          @default(true) @map("is_active")
+  // Wird bei jeder sicherheitskritischen Passwortänderung erhöht (eigene
+  // UND administrative Änderung) - das JWT trägt den Wert zum Zeitpunkt des
+  // Logins als Claim. getCurrentUser() vergleicht diesen Claim gegen den
+  // aktuellen DB-Wert; weicht er ab, ist die Session logisch ungültig, auch
+  // wenn das JWT selbst noch nicht abgelaufen ist (siehe src/server/rbac.ts).
+  // Einfacher und robuster als ein serverseitiger Session-/Token-Blacklist-
+  // Store, den wir mit der reinen JWT-Strategie sonst zusätzlich bräuchten.
+  authVersion      Int              @default(1) @map("auth_version")
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  auditLogs         AuditLog[]
+  assignedCompanies Company[]       @relation("CompanyAssignedUser")
+  assignedContacts  Contact[]       @relation("ContactAssignedUser")
+  assignedLeads     Lead[]          @relation("LeadAssignedUser")
+  assignedDeals     Deal[]          @relation("DealAssignedUser")
+  assignedTasks     Task[]          @relation("TaskAssignedUser")
+  createdTasks      Task[]          @relation("TaskCreatedBy")
+  notes             Note[]
+  activities        Activity[]
+  sentEmails        EmailMessage[]
+  assignedEvents    CalendarEvent[] @relation("EventAssignedUser")
+  createdEvents     CalendarEvent[] @relation("EventCreatedBy")
+
+  @@map("users")
+}
+
+// Zweistufiges Login-Rate-Limiting, beide Stufen entkoppelt vom User-Model
+// (siehe ausführliche Erläuterung im Chat). Zähler/Sperre werden je Zeile
+// über ein einzelnes atomares "INSERT ... ON CONFLICT DO UPDATE" gepflegt
+// (siehe src/modules/auth/rate-limit.ts) – race-condition-sicher auch mit
+// mehreren PM2-Prozessen, da Postgres die Zeile dabei serialisiert.
+
+// Stufe 1: pro Account/Identifier. identifierHash = HMAC-SHA256("identifier:"+
+// normalisierte E-Mail) mit LOGIN_RATE_LIMIT_SECRET. Existiert unabhängig davon,
+// ob zur E-Mail ein User existiert (verhindert User Enumeration über die
+// Existenz dieser Zeile). Wird bei erfolgreichem Login gelöscht (kein
+// dauerhafter Zustand über den Bedarf hinaus).
+model LoginIdentifierRateLimit {
+  id              String    @id @default(cuid())
+  identifierHash  String    @unique @map("identifier_hash")
+  failedCount     Int       @default(0) @map("failed_count")
+  windowStartedAt DateTime  @default(now()) @map("window_started_at")
+  lockedUntil     DateTime? @map("locked_until")
+  updatedAt       DateTime  @updatedAt @map("updated_at")
+
+  @@map("login_identifier_rate_limits")
+}
+
+// Stufe 2: pro Herkunft (IP), grober Schutz gegen verteilte Versuche mit
+// wechselnden E-Mail-Adressen von derselben Quelle. originHash = HMAC-SHA256
+// ("origin:"+IP) mit demselben Secret, aber domänengetrenntem Präfix – die
+// Klartext-IP wird nie gespeichert. Wird NICHT bei jedem einzelnen
+// erfolgreichen Login zurückgesetzt (der Bucket wird von mehreren Accounts
+// geteilt); sie läuft stattdessen passiv über das Zeitfenster ab.
+model LoginOriginRateLimit {
+  id              String    @id @default(cuid())
+  originHash      String    @unique @map("origin_hash")
+  failedCount     Int       @default(0) @map("failed_count")
+  windowStartedAt DateTime  @default(now()) @map("window_started_at")
+  lockedUntil     DateTime? @map("locked_until")
+  updatedAt       DateTime  @updatedAt @map("updated_at")
+
+  @@map("login_origin_rate_limits")
+}
+
+// userId ist bewusst optional: spätere Systemereignisse (z. B. geplante Jobs)
+// sollen ebenfalls protokollierbar sein, ohne einen handelnden Benutzer zu haben.
+model AuditLog {
+  id         String         @id @default(cuid())
+  actorType  AuditActorType @default(USER) @map("actor_type")
+  userId     String?        @map("user_id")
+  user       User?          @relation(fields: [userId], references: [id], onDelete: SetNull)
+  action     String
+  entityType String         @map("entity_type")
+  entityId   String?        @map("entity_id")
+  metadata   Json?
+  createdAt  DateTime       @default(now()) @map("created_at")
+
+  @@index([userId])
+  @@index([createdAt])
+  @@map("audit_logs")
+}
+
+// ============================================================================
+// Phase 2 – Unternehmen & Kontakte
+// ============================================================================
+
+enum CompanySize {
+  SOLO
+  MICRO
+  SMALL
+  MEDIUM
+  LARGE
+  ENTERPRISE
+
+  @@map("company_size")
+}
+
+enum CompanyStatus {
+  PROSPECT
+  ACTIVE_CUSTOMER
+  INACTIVE
+  LOST
+
+  @@map("company_status")
+}
+
+// Gemeinsame Quelle für Company UND Contact (identische Liste in den
+// Projektvorgaben) - ein Enum statt zwei identischer, spart Duplikation.
+enum Source {
+  LINKEDIN
+  WEBSITE
+  REFERRAL
+  PHONE
+  EMAIL
+  NETWORK
+  EVENT
+  EXISTING_CUSTOMER
+  OTHER
+
+  @@map("source")
+}
+
+enum PotentialNeed {
+  CUSTOM_SOFTWARE
+  HANDWERK_OS
+  WEBSITE
+  SEO
+  DIGITALIZATION
+  PROCESS_OPTIMIZATION
+  CONSULTING
+  OTHER
+
+  @@map("potential_need")
+}
+
+enum ContactStatus {
+  NEW
+  ACTIVE
+  CUSTOMER
+  INACTIVE
+  LOST
+
+  @@map("contact_status")
+}
+
+// Fachliche CRM-Timeline, für Benutzer sichtbar - NICHT zu verwechseln mit
+// AuditLog (Sicherheit/Systemnachvollziehbarkeit). Beide können bei derselben
+// Aktion entstehen, dienen aber unterschiedlichen Zwecken (siehe Erläuterung
+// im Chat). Absichtlich schlank: kein eigenes UI außerhalb der
+// Detailseiten-Timeline in dieser Phase.
+enum ActivityType {
+  INVOICE_CREATED
+  INVOICE_UPDATED
+  INVOICE_READY
+  INVOICE_SENT
+  INVOICE_PAID
+  INVOICE_CANCELLED
+  INVOICE_REOPENED
+  INVOICE_DELETED
+  QUOTE_CREATED
+  QUOTE_UPDATED
+  QUOTE_READY
+  QUOTE_SENT
+  QUOTE_ACCEPTED
+  QUOTE_REJECTED
+  QUOTE_CANCELLED
+  QUOTE_EXPIRED
+  QUOTE_REOPENED
+  QUOTE_DELETED
+  CALENDAR_EVENT_CREATED
+  CALENDAR_EVENT_UPDATED
+  CALENDAR_EVENT_RESCHEDULED
+  CALENDAR_EVENT_COMPLETED
+  CALENDAR_EVENT_CANCELLED
+  CALENDAR_EVENT_REOPENED
+  CALENDAR_EVENT_DELETED
+  EMAIL_SENT
+  EMAIL_FAILED
+  CALL_LOGGED
+  COMPANY_CREATED
+  COMPANY_UPDATED
+  CONTACT_CREATED
+  CONTACT_UPDATED
+  NOTE_ADDED
+  LEAD_CREATED
+  LEAD_UPDATED
+  LEAD_STAGE_CHANGED
+  LEAD_WON
+  LEAD_LOST
+  LEAD_FOLLOW_UP_CHANGED
+  DEAL_CREATED
+  DEAL_UPDATED
+  DEAL_WON
+  DEAL_LOST
+  DEAL_REOPENED
+  TASK_CREATED
+  TASK_UPDATED
+  TASK_COMPLETED
+  TASK_REOPENED
+  TASK_REASSIGNED
+
+  @@map("activity_type")
+}
+
+// leadId/dealId/taskId bewusst OHNE XOR-Constraint zu company/contact
+// (anders als Note) - ein zukünftiges, vollständiges Activity-Modul wird
+// hier voraussichtlich weitere Zieltypen brauchen, eine starre Mehr-Wege-
+// Regel würde das nur behindern und müsste ohnehin wieder geändert werden
+// (siehe Vorgabe).
+model Activity {
+  invoiceId String?  @map("invoice_id")
+  invoice   Invoice? @relation(fields: [invoiceId], references: [id], onDelete: Cascade)
+
+  quoteId         String?        @map("quote_id")
+  quote           Quote?         @relation(fields: [quoteId], references: [id], onDelete: Cascade)
+  calendarEventId String?        @map("calendar_event_id")
+  calendarEvent   CalendarEvent? @relation(fields: [calendarEventId], references: [id], onDelete: Cascade)
+  id              String         @id @default(cuid())
+  type            ActivityType
+  userId          String?        @map("user_id")
+  user            User?          @relation(fields: [userId], references: [id], onDelete: SetNull)
+  companyId       String?        @map("company_id")
+  company         Company?       @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  contactId       String?        @map("contact_id")
+  contact         Contact?       @relation(fields: [contactId], references: [id], onDelete: Cascade)
+  leadId          String?        @map("lead_id")
+  lead            Lead?          @relation(fields: [leadId], references: [id], onDelete: Cascade)
+  dealId          String?        @map("deal_id")
+  deal            Deal?          @relation(fields: [dealId], references: [id], onDelete: Cascade)
+  taskId          String?        @map("task_id")
+  task            Task?          @relation(fields: [taskId], references: [id], onDelete: Cascade)
+  metadata        Json?
+  createdAt       DateTime       @default(now()) @map("created_at")
+
+  @@index([companyId])
+  @@index([contactId])
+  @@index([leadId])
+  @@index([dealId])
+  @@index([taskId])
+  @@index([calendarEventId])
+  @@index([invoiceId])
+  @@index([quoteId])
+  @@index([createdAt])
+  @@index([userId, createdAt])
+  @@index([type, createdAt])
+  @@map("activities")
+}
+
+model Tag {
+  id             String   @id @default(cuid())
+  name           String
+  // Groß-/Kleinschreibung und Whitespace dürfen keine doppelten Tags
+  // erzeugen ("Handwerk" / "handwerk" / "HANDWERK" -> ein Tag).
+  normalizedName String   @unique @map("normalized_name")
+  createdAt      DateTime @default(now()) @map("created_at")
+
+  companies CompanyTag[]
+  contacts  ContactTag[]
+
+  @@map("tags")
+}
+
+model CompanyTag {
+  id        String   @id @default(cuid())
+  companyId String   @map("company_id")
+  company   Company  @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  tagId     String   @map("tag_id")
+  tag       Tag      @relation(fields: [tagId], references: [id], onDelete: Cascade)
+  createdAt DateTime @default(now()) @map("created_at")
+
+  @@unique([companyId, tagId])
+  @@index([tagId])
+  @@map("company_tags")
+}
+
+model ContactTag {
+  id        String   @id @default(cuid())
+  contactId String   @map("contact_id")
+  contact   Contact  @relation(fields: [contactId], references: [id], onDelete: Cascade)
+  tagId     String   @map("tag_id")
+  tag       Tag      @relation(fields: [tagId], references: [id], onDelete: Cascade)
+  createdAt DateTime @default(now()) @map("created_at")
+
+  @@unique([contactId, tagId])
+  @@index([tagId])
+  @@map("contact_tags")
+}
+
+// Company <-> PotentialNeed als Join-Tabelle statt kommagetrennter Strings -
+// "mehrere mögliche Bedarfe" bleiben so einzeln abfragbar/filterbar.
+model CompanyNeed {
+  id        String        @id @default(cuid())
+  companyId String        @map("company_id")
+  company   Company       @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  need      PotentialNeed
+  createdAt DateTime      @default(now()) @map("created_at")
+
+  @@unique([companyId, need])
+  @@map("company_needs")
+}
+
+// Eine Notiz gehört serverseitig validiert IMMER zu genau einem Ziel
+// (Company XOR Contact XOR Lead XOR Deal) - siehe src/validations/note.ts UND
+// die PostgreSQL-CHECK-Constraint "notes_exactly_one_target_check" (zuletzt
+// migriert in 20261001.._add_deals, 4-Wege-Variante statt der
+// 3-Wege-Variante aus Phase 3).
+model Note {
+  id        String   @id @default(cuid())
+  content   String
+  authorId  String   @map("author_id")
+  author    User     @relation(fields: [authorId], references: [id])
+  companyId String?  @map("company_id")
+  company   Company? @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  contactId String?  @map("contact_id")
+  contact   Contact? @relation(fields: [contactId], references: [id], onDelete: Cascade)
+  leadId    String?  @map("lead_id")
+  lead      Lead?    @relation(fields: [leadId], references: [id], onDelete: Cascade)
+  dealId    String?  @map("deal_id")
+  deal      Deal?    @relation(fields: [dealId], references: [id], onDelete: Cascade)
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@index([companyId])
+  @@index([contactId])
+  @@index([leadId])
+  @@index([dealId])
+  @@map("notes")
+}
+
+model Company {
+  files           FileAttachment[]
+  invoices        Invoice[]
+  quotes          Quote[]
+  calendarEvents  CalendarEvent[]
+  emails          EmailMessage[]
+  id              String           @id @default(cuid())
+  name            String
+  website         String?
+  // Normalisierte Domain (z. B. "example.de") für Duplikaterkennung/Vergleich
+  // - der Originalwert in `website` bleibt für die Anzeige unverändert.
+  websiteDomain   String?          @map("website_domain")
+  industry        String?
+  phone           String?
+  email           String?
+  emailNormalized String?          @map("email_normalized")
+  street          String?
+  postalCode      String?          @map("postal_code")
+  city            String?
+  country         String?
+  employeeCount   Int?             @map("employee_count")
+  companySize     CompanySize?     @map("company_size")
+  description     String?
+  status          CompanyStatus    @default(PROSPECT)
+  source          Source?
+  assignedUserId  String?          @map("assigned_user_id")
+  assignedUser    User?            @relation("CompanyAssignedUser", fields: [assignedUserId], references: [id], onDelete: SetNull)
+
+  createdAt DateTime  @default(now()) @map("created_at")
+  updatedAt DateTime  @updatedAt @map("updated_at")
+  deletedAt DateTime? @map("deleted_at")
+
+  contacts   Contact[]
+  tags       CompanyTag[]
+  needs      CompanyNeed[]
+  notes      Note[]
+  activities Activity[]
+  leads      Lead[]
+  deals      Deal[]
+  tasks      Task[]
+
+  @@index([name])
+  @@index([status])
+  @@index([source])
+  @@index([assignedUserId])
+  @@index([deletedAt])
+  @@index([updatedAt])
+  @@map("companies")
+}
+
+model Contact {
+  files              FileAttachment[]
+  invoices           Invoice[]
+  quotes             Quote[]
+  calendarEvents     CalendarEvent[]
+  emails             EmailMessage[]
+  id                 String           @id @default(cuid())
+  firstName          String?          @map("first_name")
+  lastName           String?          @map("last_name")
+  jobTitle           String?          @map("job_title")
+  email              String?
+  emailNormalized    String?          @map("email_normalized")
+  phone              String?
+  phoneNormalized    String?          @map("phone_normalized")
+  mobile             String?
+  mobileNormalized   String?          @map("mobile_normalized")
+  linkedinUrl        String?          @map("linkedin_url")
+  linkedinNormalized String?          @map("linkedin_normalized")
+  website            String?
+  source             Source?
+  status             ContactStatus    @default(NEW)
+  companyId          String?          @map("company_id")
+  company            Company?         @relation(fields: [companyId], references: [id], onDelete: SetNull)
+  assignedUserId     String?          @map("assigned_user_id")
+  assignedUser       User?            @relation("ContactAssignedUser", fields: [assignedUserId], references: [id], onDelete: SetNull)
+
+  createdAt DateTime  @default(now()) @map("created_at")
+  updatedAt DateTime  @updatedAt @map("updated_at")
+  deletedAt DateTime? @map("deleted_at")
+
+  tags       ContactTag[]
+  notes      Note[]
+  activities Activity[]
+  leads      Lead[]
+  deals      Deal[]
+  tasks      Task[]
+
+  @@index([emailNormalized])
+  @@index([companyId])
+  @@index([status])
+  @@index([source])
+  @@index([assignedUserId])
+  @@index([deletedAt])
+  @@index([updatedAt])
+  @@map("contacts")
+}
+
+// ============================================================================
+// Phase 3 – Leads & Sales Pipeline
+// ============================================================================
+
+enum LeadStatus {
+  OPEN
+  WON
+  LOST
+  ARCHIVED
+
+  @@map("lead_status")
+}
+
+enum Priority {
+  LOW
+  NORMAL
+  HIGH
+  VERY_HIGH
+
+  @@map("priority")
+}
+
+// Pipeline-Konfiguration: für Version 1 genügt eine aktive Standardpipeline,
+// die Architektur (eigenständiges Model + isDefault-Flag statt eines
+// hartcodierten Singletons) erlaubt spätere weitere Pipelines ohne
+// Migration.
+//
+// Der partielle Unique-Index auf is_default (siehe Migration) garantiert nur
+// "höchstens eine" Standardpipeline auf DB-Ebene - NICHT "mindestens eine".
+// "Mindestens eine" relational zu erzwingen würde eine künstliche
+// DB-Konstruktion erfordern (z. B. einen Trigger oder eine Fremdschlüssel-
+// Rückreferenz von einer Singleton-Konfigurationstabelle), die für diesen
+// Fall unverhältnismäßig wäre. Stattdessen stellt die Anwendungsseite
+// ("mindestens eine") sicher: `prisma/seed.ts` (`seedDefaultPipeline`) legt
+// beim ersten Lauf idempotent eine Standardpipeline an, falls noch keine
+// existiert. Eine fehlende Standardpipeline (z. B. nach manuellem Löschen
+// aller Pipelines in der DB) ist daher ein Deployment-/Betriebsfehler, kein
+// Zustand, den das Schema verhindern muss.
+model Pipeline {
+  id          String   @id @default(cuid())
+  name        String
+  description String?
+  isDefault   Boolean  @default(false) @map("is_default")
+  isActive    Boolean  @default(true) @map("is_active")
+  createdAt   DateTime @default(now()) @map("created_at")
+  updatedAt   DateTime @updatedAt @map("updated_at")
+
+  stages PipelineStage[]
+  leads  Lead[]
+
+  @@map("pipelines")
+}
+
+// isWonStage/isLostStage sind die einzige Quelle der Wahrheit dafür, ob eine
+// Stufe eine Gewonnen-/Verloren-Stufe ist - niemals über den Namen der Stufe
+// erkennen (siehe src/modules/leads/stage-status.ts).
+//
+// Drei zusätzliche Invarianten werden NICHT nur applikativ, sondern per
+// Migration direkt in PostgreSQL erzwungen (Prisma kann CHECK-Constraints
+// und partielle Unique-Indizes nicht deklarativ im Schema ausdrücken):
+// 1. Eine Stufe darf nie gleichzeitig Won UND Lost sein
+//    (CHECK: NOT (is_won_stage AND is_lost_stage)).
+// 2. Höchstens eine Won-Stufe pro Pipeline
+//    (partieller Unique-Index auf pipeline_id WHERE is_won_stage = true).
+// 3. Höchstens eine Lost-Stufe pro Pipeline
+//    (partieller Unique-Index auf pipeline_id WHERE is_lost_stage = true).
+// Unterschiedliche Pipelines dürfen jeweils eigene Won-/Lost-Stufen haben,
+// da pipeline_id Teil des indexierten Schlüssels ist.
+// Soft Delete (deletedAt) statt Hard Delete (siehe Vorgabe Punkt 12): eine
+// Stufe mit zugeordneten Leads wird gar nicht erst zum Löschen freigegeben
+// (serverseitig blockiert, siehe src/modules/pipeline/actions.ts) - Soft
+// Delete ist trotzdem die saubere Grundlage, falls eine künftig
+// leads-freie Stufe entfernt wird, ohne die Historie referenzierender
+// Activities/AuditLogs zu verwaisen. Die drei bestehenden partiellen
+// Unique-Indizes (Position je Pipeline, höchstens eine Won-/Lost-Stufe je
+// Pipeline) wurden in der Phase-6-Migration um "AND deleted_at IS NULL"
+// ergänzt, damit eine gelöschte Stufe keinen Slot/Flag mehr blockiert.
+// `version` ermöglicht Optimistic Concurrency Control bei
+// Bearbeitung/Reorder, identisch zur Lead/Deal/Task-Strategie.
+model PipelineStage {
+  id          String    @id @default(cuid())
+  pipelineId  String    @map("pipeline_id")
+  pipeline    Pipeline  @relation(fields: [pipelineId], references: [id], onDelete: Cascade)
+  name        String
+  position    Int
+  probability Int?
+  color       String?
+  isWonStage  Boolean   @default(false) @map("is_won_stage")
+  isLostStage Boolean   @default(false) @map("is_lost_stage")
+  version     Int       @default(1)
+  createdAt   DateTime  @default(now()) @map("created_at")
+  updatedAt   DateTime  @updatedAt @map("updated_at")
+  deletedAt   DateTime? @map("deleted_at")
+
+  leads Lead[]
+
+  // Die eigentliche Eindeutigkeit (Position je Pipeline, s.o.) wird über
+  // einen partiellen Index in der Migration abgesichert, nicht hier - ein
+  // @@unique in Prisma kennt kein "WHERE deleted_at IS NULL".
+  @@index([pipelineId, position])
+  @@index([deletedAt])
+  @@map("pipeline_stages")
+}
+
+// Ein Lead darf mit Company, Contact oder beiden verbunden sein (siehe
+// Vorgabe). Komplett ohne beide ist fachlich nur in Ausnahmefällen sinnvoll
+// (z. B. ein noch unqualifizierter Messekontakt ohne jede Stammdaten) - wir
+// lassen das technisch zu, erzwingen aber mindestens EINES der beiden über
+// eine PostgreSQL-CHECK-Constraint (siehe Migration), damit kein Lead
+// komplett im luftleeren Raum hängt. "Stage gehört zur Pipeline des Leads"
+// wird NICHT über eine Composite-Foreign-Key-Konstruktion erzwungen (Prisma
+// unterstützt das nur sehr umständlich über zwei relations auf dasselbe
+// Feld), sondern zentral in src/modules/leads/stage-status.ts bei jeder
+// Mutation geprüft - eine einzige Stelle, nicht dupliziert.
+//
+// Geldbetrag: `expectedValueCents` als Int in Cent (kleinste Währungseinheit)
+// statt Float/Decimal - vermeidet Fließkomma-Rundungsfehler bei Geldbeträgen
+// vollständig, ohne die zusätzliche Komplexität von Prismas Decimal-Typ
+// (eigene Decimal.js-artige Arithmetik im Client) für diesen einfachen
+// Anwendungsfall zu benötigen. Anzeige: Division durch 100.
+//
+// `version` ermöglicht Optimistic Concurrency Control beim Stage-Move (siehe
+// src/modules/leads/actions.ts) - ein `UPDATE ... WHERE id = ? AND version =
+// ?` mit 0 betroffenen Zeilen bedeutet, ein anderer Request kam zuerst.
+model Lead {
+  reminders          Reminder[]
+  calendarEvents     CalendarEvent[]
+  emails             EmailMessage[]
+  id                 String          @id @default(cuid())
+  title              String
+  contactId          String?         @map("contact_id")
+  contact            Contact?        @relation(fields: [contactId], references: [id], onDelete: SetNull)
+  companyId          String?         @map("company_id")
+  company            Company?        @relation(fields: [companyId], references: [id], onDelete: SetNull)
+  pipelineId         String          @map("pipeline_id")
+  pipeline           Pipeline        @relation(fields: [pipelineId], references: [id], onDelete: Restrict)
+  stageId            String          @map("stage_id")
+  stage              PipelineStage   @relation(fields: [stageId], references: [id], onDelete: Restrict)
+  source             Source?
+  // Bewusst das bestehende PotentialNeed-Enum wiederverwendet (fachlich
+  // identische Liste wie "Interesse/Leistung") statt eines parallelen Enums.
+  interest           PotentialNeed?
+  expectedValueCents Int?            @map("expected_value_cents")
+  score              Int             @default(0)
+  priority           Priority        @default(NORMAL)
+  probability        Int?
+  assignedUserId     String?         @map("assigned_user_id")
+  assignedUser       User?           @relation("LeadAssignedUser", fields: [assignedUserId], references: [id], onDelete: SetNull)
+  nextFollowUpAt     DateTime?       @map("next_follow_up_at")
+  status             LeadStatus      @default(OPEN)
+  description        String?
+  version            Int             @default(1)
+
+  createdAt DateTime  @default(now()) @map("created_at")
+  updatedAt DateTime  @updatedAt @map("updated_at")
+  deletedAt DateTime? @map("deleted_at")
+
+  notes      Note[]
+  activities Activity[]
+  // Ein Lead kann später mehrere Deals erzeugen (z. B. Erst- und
+  // Folgeauftrag) - bewusst KEINE Unique-Constraint auf leadId in Deal,
+  // siehe Begründung dort.
+  deals      Deal[]
+  tasks      Task[]
+
+  @@index([pipelineId])
+  @@index([stageId])
+  @@index([status])
+  @@index([assignedUserId])
+  @@index([nextFollowUpAt])
+  @@index([priority])
+  @@index([score])
+  @@index([deletedAt])
+  @@index([updatedAt])
+  @@index([createdAt])
+  @@map("leads")
+}
+
+// ============================================================================
+// Phase 4 – Deals
+// ============================================================================
+
+enum DealStatus {
+  OPEN
+  WON
+  LOST
+
+  // Noch kein ARCHIVED (anders als LeadStatus) - Soft Delete (`deletedAt`)
+  // deckt den "aus der aktiven Ansicht entfernen"-Anwendungsfall bereits
+  // vollständig ab, ein zusätzlicher Archiv-Zustand wäre an dieser Stelle
+  // nur eine zweite, redundante Art desselben Konzepts (siehe Vorgabe).
+  @@map("deal_status")
+}
+
+// Kleine kontrollierte Liste statt eines Freitextfelds oder eines eigenen
+// komplexen Modells - für Version 1 ausreichend und sauber auswertbar
+// (siehe Vorgabe). Bei OTHER kann optional ein Freitext in
+// `lostReasonNote` ergänzt werden.
+enum DealLostReason {
+  PRICE
+  NO_BUDGET
+  NO_NEED
+  COMPETITOR
+  NO_RESPONSE
+  POSTPONED
+  OTHER
+
+  @@map("deal_lost_reason")
+}
+
+// Ein Deal ist eine konkrete Verkaufschance für ein Unternehmen - anders als
+// ein Lead (der auch ganz ohne Company/Contact bestehen darf) MUSS ein Deal
+// einem Unternehmen zugeordnet sein. Contact und Lead sind optional: ein
+// Deal darf manuell ohne vorherigen Lead entstehen (z. B. Bestandskunde
+// meldet sich direkt mit neuem Bedarf).
+//
+// leadId trägt bewusst KEINE Unique-Constraint: ein Lead kann später
+// theoretisch mehrere Deals erzeugen (z. B. Erst- und Folgeauftrag aus
+// demselben Lead) - die Beziehung ist 1:n, nicht 1:1 (siehe Vorgabe).
+//
+// Konsistenz Lead/Company: wenn ein Deal einem Lead zugeordnet ist UND
+// dieser Lead bereits eine Company hat, darf `deal.companyId` dieser
+// Company nicht widersprechen - zentral geprüft in
+// src/modules/deals/validation.ts, nicht per DB-Constraint (eine
+// Cross-Table-CHECK-Constraint über zwei Fremdschlüssel hinweg ist in
+// PostgreSQL nur über Trigger möglich, was für diesen Anwendungsfall
+// unverhältnismäßig wäre - die zentrale Validierungsfunktion wird von
+// JEDER Mutation durchlaufen, es gibt keinen zweiten Schreibpfad).
+//
+// Geld/Concurrency: siehe `valueCents`/`version` beim Lead-Model - dieselbe
+// Cent-Integer- bzw. Optimistic-Concurrency-Control-Strategie wird hier
+// wiederverwendet, nicht neu erfunden.
+//
+// lostReason/lostReasonNote werden beim Reopen (zurück auf OPEN) bewusst
+// gelöscht statt erhalten: ein wiedereröffneter Deal hat (noch) keinen
+// Verlustgrund mehr - der alte Grund bliebe sonst irreführend stehen, bis
+// der Deal ggf. erneut verloren geht. Die Historie bleibt trotzdem
+// nachvollziehbar, da der ursprüngliche Grund in der Activity/AuditLog-
+// Metadata des `DEAL_LOST`-Eintrags erhalten bleibt.
+model Deal {
+  files             FileAttachment[]
+  reminders         Reminder[]
+  invoices          Invoice[]
+  quotes            Quote[]
+  calendarEvents    CalendarEvent[]
+  emails            EmailMessage[]
+  id                String           @id @default(cuid())
+  name              String
+  leadId            String?          @map("lead_id")
+  lead              Lead?            @relation(fields: [leadId], references: [id], onDelete: SetNull)
+  companyId         String           @map("company_id")
+  company           Company          @relation(fields: [companyId], references: [id], onDelete: Restrict)
+  contactId         String?          @map("contact_id")
+  contact           Contact?         @relation(fields: [contactId], references: [id], onDelete: SetNull)
+  assignedUserId    String?          @map("assigned_user_id")
+  assignedUser      User?            @relation("DealAssignedUser", fields: [assignedUserId], references: [id], onDelete: SetNull)
+  // Bewusst das bestehende PotentialNeed-Enum wiederverwendet (fachlich
+  // identische Liste wie "Leistung") statt eines parallelen Enums.
+  service           PotentialNeed
+  valueCents        Int              @map("value_cents")
+  probability       Int?
+  expectedCloseDate DateTime?        @map("expected_close_date")
+  closedAt          DateTime?        @map("closed_at")
+  status            DealStatus       @default(OPEN)
+  lostReason        DealLostReason?  @map("lost_reason")
+  lostReasonNote    String?          @map("lost_reason_note")
+  description       String?
+  version           Int              @default(1)
+
+  createdAt DateTime  @default(now()) @map("created_at")
+  updatedAt DateTime  @updatedAt @map("updated_at")
+  deletedAt DateTime? @map("deleted_at")
+
+  notes      Note[]
+  activities Activity[]
+  tasks      Task[]
+
+  @@index([companyId])
+  @@index([contactId])
+  @@index([leadId])
+  @@index([status])
+  @@index([assignedUserId])
+  @@index([service])
+  @@index([expectedCloseDate])
+  @@index([deletedAt])
+  @@index([updatedAt])
+  @@index([createdAt])
+  @@index([closedAt])
+  @@map("deals")
+}
+
+// ============================================================================
+// Phase 5 – Aufgaben, Follow-ups & Erinnerungslogik
+// ============================================================================
+
+enum TaskStatus {
+  OPEN
+  IN_PROGRESS
+  COMPLETED
+
+  @@map("task_status")
+}
+
+// Eine Aufgabe darf mit GENAU EINER primären CRM-Entität verknüpft sein,
+// oder mit KEINER (eine rein interne Aufgabe) - anders als bei Note (dort
+// ist IMMER genau ein Ziel Pflicht). Erzwungen über:
+// 1. Serverseitig in src/modules/tasks/validation.ts
+// 2. PostgreSQL-CHECK-Constraint via num_nonnulls(...) <= 1 (siehe Migration)
+//    - num_nonnulls() ist dafür die saubere, eingebaute PostgreSQL-Lösung,
+//    eine manuelle CASE-Summe wie beim 4-Wege-Note-XOR wäre hier nur
+//    unnötig umständlicher für dieselbe "<=1"-Prüfung.
+//
+// assignedUserId/createdById sind PFLICHT (jede Aufgabe gehört immer einem
+// Benutzer und hat einen Ersteller) und nutzen onDelete: Restrict - ein
+// User kann nicht hart gelöscht werden, solange ihm Aufgaben zugewiesen
+// sind oder er welche erstellt hat (SetNull wäre hier ohnehin unzulässig,
+// da das Feld nicht optional ist). Das bloße DEAKTIVIEREN eines Benutzers
+// (isActive=false) berührt diese Fremdschlüssel gar nicht - Aufgaben
+// verschwinden dadurch nie (siehe Vorgabe Punkt 5).
+//
+// companyId/contactId/leadId/dealId nutzen (anders als bei Deal, wo
+// companyId Pflicht ist) onDelete: SetNull, analog zu Lead.companyId/
+// contactId - ein hart gelöschter CRM-Datensatz soll die verknüpfte
+// Aufgabe nicht mitreißen, sondern nur die Verknüpfung lösen.
+//
+// dueAt ist PFLICHT und wird intern immer als UTC-Instant gespeichert.
+// Wird im Formular keine Uhrzeit angegeben, wird bewusst 23:59:59 Europe/
+// Berlin des gewählten Tages gespeichert (nicht 00:00 Uhr) - eine Aufgabe
+// "fällig am 01.10." soll bis zum Ende dieses Tages (in der tatsächlichen
+// Zeitzone der Organisation) nicht als überfällig gelten. Siehe
+// src/lib/timezone.ts für die Europe/Berlin-Umrechnung (inkl. Sommer-/
+// Winterzeit) und src/modules/tasks/due.ts für die zentrale
+// Überfällig/Heute/Kommend-Logik.
+//
+// reminderAt ist optional und muss <= dueAt sein - sowohl serverseitig
+// (Zod) als auch per CHECK-Constraint abgesichert (siehe Migration). In
+// Phase 5 bedeutet ein gesetztes reminderAt nur "als erinnerungsrelevant
+// markiert" (siehe getTasksWithDueReminders) - es wird noch KEINE
+// Benachrichtigung (E-Mail/Push/Scheduler) ausgelöst.
+//
+// version ermöglicht Optimistic Concurrency Control, identisch zur
+// Lead/Deal-Strategie.
+model Task {
+  reminders      Reminder[]
+  calendarEvents CalendarEvent[]
+  id             String          @id @default(cuid())
+  title          String
+  description    String?
+  status         TaskStatus      @default(OPEN)
+  priority       Priority        @default(NORMAL)
+  dueAt          DateTime        @map("due_at")
+  completedAt    DateTime?       @map("completed_at")
+  assignedUserId String          @map("assigned_user_id")
+  assignedUser   User            @relation("TaskAssignedUser", fields: [assignedUserId], references: [id], onDelete: Restrict)
+  createdById    String          @map("created_by_id")
+  createdBy      User            @relation("TaskCreatedBy", fields: [createdById], references: [id], onDelete: Restrict)
+  companyId      String?         @map("company_id")
+  company        Company?        @relation(fields: [companyId], references: [id], onDelete: SetNull)
+  contactId      String?         @map("contact_id")
+  contact        Contact?        @relation(fields: [contactId], references: [id], onDelete: SetNull)
+  leadId         String?         @map("lead_id")
+  lead           Lead?           @relation(fields: [leadId], references: [id], onDelete: SetNull)
+  dealId         String?         @map("deal_id")
+  deal           Deal?           @relation(fields: [dealId], references: [id], onDelete: SetNull)
+  reminderAt     DateTime?       @map("reminder_at")
+  version        Int             @default(1)
+
+  createdAt DateTime  @default(now()) @map("created_at")
+  updatedAt DateTime  @updatedAt @map("updated_at")
+  deletedAt DateTime? @map("deleted_at")
+
+  activities Activity[]
+
+  @@index([assignedUserId])
+  @@index([status])
+  @@index([priority])
+  @@index([dueAt])
+  @@index([reminderAt])
+  @@index([companyId])
+  @@index([contactId])
+  @@index([leadId])
+  @@index([dealId])
+  @@index([deletedAt])
+  @@index([updatedAt])
+  @@index([completedAt])
+  @@map("tasks")
+}
+
+// ============================================================================
+// Phase 6 – Administration, Benutzer & CRM-Einstellungen
+// ============================================================================
+
+// Kleine kontrollierte Liste unterstützter Score-Regeln statt einer frei
+// programmierbaren Rule Engine (siehe Vorgabe) - ausschließlich die vier
+// Regeln, die calculateLeadScore() bereits kennt (siehe
+// src/modules/leads/score.ts). Punktwerte/enabled sind administrierbar,
+// die Regel-LOGIK selbst (wann eine Regel greift) bleibt fest im Code -
+// kein JS-Code oder Ausdruck wird in der Datenbank gespeichert.
+enum LeadScoreRuleName {
+  LINKEDIN_SOURCE
+  DACH_COMPANY
+  SME_COMPANY
+  NEED_IDENTIFIED
+
+  @@map("lead_score_rule_name")
+}
+
+model LeadScoreRule {
+  id        String            @id @default(cuid())
+  rule      LeadScoreRuleName @unique
+  points    Int
+  enabled   Boolean           @default(true)
+  createdAt DateTime          @default(now()) @map("created_at")
+  updatedAt DateTime          @updatedAt @map("updated_at")
+
+  @@map("lead_score_rules")
+}
+
+// Singleton-Konfiguration (siehe Vorgabe Punkt 21) - `singleton` ist
+// IMMER `true` und trägt eine Unique-Constraint, wodurch per Definition
+// nie mehr als eine Zeile existieren kann (dieselbe Idee wie der
+// partielle Unique-Index für "höchstens eine Standardpipeline" in Phase
+// 3, hier aber als einfache normale Unique-Constraint, da keine
+// WHERE-Bedingung nötig ist). Der Seed legt die Zeile idempotent an,
+// falls sie fehlt - exakt wie bei Pipeline/seedDefaultPipeline().
+//
+// Bewusst KEIN `defaultPipelineId`-Feld hier, obwohl die Vorgabe das
+// erwähnt: "welche Pipeline ist die Standardpipeline" wird bereits durch
+// `Pipeline.isDefault` (abgesichert über einen partiellen Unique-Index,
+// siehe dort) als einzige Quelle der Wahrheit abgebildet. Ein zweites
+// Feld hier würde dieselbe Information doppelt und potenziell
+// widersprüchlich vorhalten. Die Einstellungsseite /settings/general
+// zeigt/ändert daher die Standardpipeline direkt über diesen bestehenden
+// Mechanismus, nicht über ein neues Feld.
+model SystemSettings {
+  legalCompanyName       String   @default("") @map("legal_company_name")
+  street                 String   @default("")
+  postalCode             String   @default("") @map("postal_code")
+  city                   String   @default("")
+  country                String   @default("")
+  vatId                  String   @default("") @map("vat_id")
+  taxNumber              String   @default("") @map("tax_number")
+  iban                   String   @default("")
+  bic                    String   @default("")
+  bankName               String   @default("") @map("bank_name")
+  defaultPaymentTermDays Int      @default(14) @map("default_payment_term_days")
+  id                     String   @id @default(cuid())
+  singleton              Boolean  @unique @default(true)
+  companyName            String   @map("company_name")
+  timezone               String
+  currency               String
+  version                Int      @default(1)
+  createdAt              DateTime @default(now()) @map("created_at")
+  updatedAt              DateTime @updatedAt @map("updated_at")
+
+  @@map("system_settings")
+}
+
+// Phase 7: SMTP-only Kommunikationsnachweis, keine Delete-UI oder Retention-Jobs.
+enum EmailDirection {
+  OUTBOUND
+
+  @@map("email_direction")
+}
+
+enum EmailStatus {
+  DRAFT
+  SENDING
+  SENT
+  FAILED
+
+  @@map("email_status")
+}
+
+model EmailMessage {
+  invoiceId         String?        @map("invoice_id")
+  invoice           Invoice?       @relation(fields: [invoiceId], references: [id], onDelete: Restrict)
+  invoiceVersion    Int?           @map("invoice_version")
+  quoteId           String?        @map("quote_id")
+  quote             Quote?         @relation(fields: [quoteId], references: [id], onDelete: Restrict)
+  quoteVersion      Int?           @map("quote_version")
+  id                String         @id @default(cuid())
+  direction         EmailDirection @default(OUTBOUND)
+  status            EmailStatus
+  idempotencyKey    String         @unique @map("idempotency_key")
+  requestHash       String         @map("request_hash")
+  fromEmail         String         @map("from_email")
+  fromName          String?        @map("from_name")
+  toEmail           String         @map("to_email")
+  toName            String?        @map("to_name")
+  subject           String
+  textBody          String         @map("text_body")
+  htmlBody          String?        @map("html_body")
+  contactId         String?        @map("contact_id")
+  contact           Contact?       @relation(fields: [contactId], references: [id], onDelete: SetNull)
+  companyId         String?        @map("company_id")
+  company           Company?       @relation(fields: [companyId], references: [id], onDelete: SetNull)
+  leadId            String?        @map("lead_id")
+  lead              Lead?          @relation(fields: [leadId], references: [id], onDelete: SetNull)
+  dealId            String?        @map("deal_id")
+  deal              Deal?          @relation(fields: [dealId], references: [id], onDelete: SetNull)
+  sentByUserId      String         @map("sent_by_user_id")
+  sentByUser        User           @relation(fields: [sentByUserId], references: [id], onDelete: Restrict)
+  sentAt            DateTime?      @map("sent_at")
+  failedAt          DateTime?      @map("failed_at")
+  errorCode         String?        @map("error_code")
+  errorMessage      String?        @map("error_message")
+  providerMessageId String?        @map("provider_message_id")
+  createdAt         DateTime       @default(now()) @map("created_at")
+  updatedAt         DateTime       @updatedAt @map("updated_at")
+
+  @@index([invoiceId, createdAt])
+  @@index([sentByUserId, createdAt])
+  @@index([quoteId, createdAt])
+  @@index([status, createdAt])
+  @@index([contactId, createdAt])
+  @@index([companyId, createdAt])
+  @@index([leadId, createdAt])
+  @@index([dealId, createdAt])
+  @@map("email_messages")
+}
+
+model EmailTemplate {
+  id        String   @id @default(cuid())
+  name      String
+  subject   String
+  body      String
+  isActive  Boolean  @default(true) @map("is_active")
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@map("email_templates")
+}
+
+enum CalendarEventStatus {
+  SCHEDULED
+  COMPLETED
+  CANCELLED
+
+  @@map("calendar_event_status")
+}
+
+enum QuoteStatus {
+  DRAFT
+  READY
+  SENT
+  ACCEPTED
+  REJECTED
+  EXPIRED
+  CANCELLED
+
+  @@map("quote_status")
+}
+
+model QuoteNumberSequence {
+  year       Int @id
+  lastNumber Int @map("last_number")
+
+  @@map("quote_number_sequences")
+}
+
+// Document snapshots are refreshed only on explicit content save. Sending freezes them.
+model Quote {
+  reminders          Reminder[]
+  invoices           Invoice[]
+  id                 String         @id @default(cuid())
+  quoteNumber        String         @unique @map("quote_number")
+  status             QuoteStatus    @default(DRAFT)
+  companyId          String         @map("company_id")
+  company            Company        @relation(fields: [companyId], references: [id], onDelete: Restrict)
+  contactId          String?        @map("contact_id")
+  contact            Contact?       @relation(fields: [contactId], references: [id], onDelete: Restrict)
+  dealId             String?        @map("deal_id")
+  deal               Deal?          @relation(fields: [dealId], references: [id], onDelete: Restrict)
+  assignedUserId     String         @map("assigned_user_id")
+  assignedUser       User           @relation("QuoteAssignedUser", fields: [assignedUserId], references: [id], onDelete: Restrict)
+  createdById        String         @map("created_by_id")
+  createdBy          User           @relation("QuoteCreatedBy", fields: [createdById], references: [id], onDelete: Restrict)
+  issueDate          DateTime       @map("issue_date") @db.Date
+  validUntil         DateTime       @map("valid_until") @db.Date
+  currency           String
+  subtotalCents      Int            @map("subtotal_cents")
+  taxCents           Int            @map("tax_cents")
+  totalCents         Int            @map("total_cents")
+  taxRateBasisPoints Int            @default(1900) @map("tax_rate_basis_points")
+  issuerName         String         @map("issuer_name")
+  recipientName      String         @map("recipient_name")
+  recipientAddress   String         @map("recipient_address")
+  recipientContact   String?        @map("recipient_contact")
+  introText          String?        @map("intro_text")
+  closingText        String?        @map("closing_text")
+  internalNote       String?        @map("internal_note")
+  customerNote       String?        @map("customer_note")
+  sentAt             DateTime?      @map("sent_at")
+  acceptedAt         DateTime?      @map("accepted_at")
+  rejectedAt         DateTime?      @map("rejected_at")
+  version            Int            @default(1)
+  createdAt          DateTime       @default(now()) @map("created_at")
+  updatedAt          DateTime       @updatedAt @map("updated_at")
+  deletedAt          DateTime?      @map("deleted_at")
+  items              QuoteItem[]
+  emails             EmailMessage[]
+  activities         Activity[]
+
+  @@index([companyId])
+  @@index([contactId])
+  @@index([dealId])
+  @@index([assignedUserId])
+  @@index([deletedAt, status])
+  @@index([issueDate])
+  @@index([validUntil])
+  @@index([updatedAt])
+  @@map("quotes")
+}
+
+model QuoteItem {
+  id                 String   @id @default(cuid())
+  quoteId            String   @map("quote_id")
+  quote              Quote    @relation(fields: [quoteId], references: [id], onDelete: Cascade)
+  position           Int
+  title              String
+  description        String?
+  // Thousandths: 1500 = 1.5 units. Money calculations use BigInt intermediates.
+  quantity           Int
+  unit               String
+  unitPriceCents     Int      @map("unit_price_cents")
+  taxRateBasisPoints Int?     @map("tax_rate_basis_points")
+  lineSubtotalCents  Int      @map("line_subtotal_cents")
+  lineTaxCents       Int      @map("line_tax_cents")
+  lineTotalCents     Int      @map("line_total_cents")
+  createdAt          DateTime @default(now()) @map("created_at")
+  updatedAt          DateTime @updatedAt @map("updated_at")
+
+  @@unique([quoteId, position])
+  @@map("quote_items")
+}
+
+// UTC instants. All-day: Berlin midnight to exclusive following midnight.
+model CalendarEvent {
+  id             String              @id @default(cuid())
+  title          String
+  description    String?
+  startsAt       DateTime            @map("starts_at")
+  endsAt         DateTime            @map("ends_at")
+  allDay         Boolean             @default(false) @map("all_day")
+  location       String?
+  status         CalendarEventStatus @default(SCHEDULED)
+  assignedUserId String              @map("assigned_user_id")
+  assignedUser   User                @relation("EventAssignedUser", fields: [assignedUserId], references: [id], onDelete: Restrict)
+  createdById    String              @map("created_by_id")
+  createdBy      User                @relation("EventCreatedBy", fields: [createdById], references: [id], onDelete: Restrict)
+  companyId      String?             @map("company_id")
+  company        Company?            @relation(fields: [companyId], references: [id], onDelete: SetNull)
+  contactId      String?             @map("contact_id")
+  contact        Contact?            @relation(fields: [contactId], references: [id], onDelete: SetNull)
+  leadId         String?             @map("lead_id")
+  lead           Lead?               @relation(fields: [leadId], references: [id], onDelete: SetNull)
+  dealId         String?             @map("deal_id")
+  deal           Deal?               @relation(fields: [dealId], references: [id], onDelete: SetNull)
+  taskId         String?             @map("task_id")
+  task           Task?               @relation(fields: [taskId], references: [id], onDelete: SetNull)
+  activities     Activity[]
+  createdAt      DateTime            @default(now()) @map("created_at")
+  updatedAt      DateTime            @updatedAt @map("updated_at")
+  deletedAt      DateTime?           @map("deleted_at")
+  version        Int                 @default(1)
+
+  @@index([assignedUserId, startsAt])
+  @@index([deletedAt, status, startsAt])
+  @@index([endsAt])
+  @@index([companyId])
+  @@index([contactId])
+  @@index([leadId])
+  @@index([dealId])
+  @@index([taskId])
+  @@map("calendar_events")
+}
+
+enum InvoiceStatus {
+  DRAFT
+  READY
+  SENT
+  PAID
+  OVERDUE
+  CANCELLED
+
+  @@map("invoice_status")
+}
+
+model InvoiceNumberSequence {
+  year       Int @id
+  lastNumber Int @map("last_number")
+
+  @@map("invoice_number_sequences")
+}
+
+// Document snapshots are refreshed only on explicit content save. Sending freezes them.
+model Invoice {
+  reminders          Reminder[]
+  quoteId            String?        @map("quote_id")
+  quote              Quote?         @relation(fields: [quoteId], references: [id], onDelete: Restrict)
+  issuerSnapshot     Json           @map("issuer_snapshot")
+  id                 String         @id @default(cuid())
+  invoiceNumber      String         @unique @map("invoice_number")
+  status             InvoiceStatus  @default(DRAFT)
+  companyId          String         @map("company_id")
+  company            Company        @relation(fields: [companyId], references: [id], onDelete: Restrict)
+  contactId          String?        @map("contact_id")
+  contact            Contact?       @relation(fields: [contactId], references: [id], onDelete: Restrict)
+  dealId             String?        @map("deal_id")
+  deal               Deal?          @relation(fields: [dealId], references: [id], onDelete: Restrict)
+  assignedUserId     String         @map("assigned_user_id")
+  assignedUser       User           @relation("InvoiceAssignedUser", fields: [assignedUserId], references: [id], onDelete: Restrict)
+  createdById        String         @map("created_by_id")
+  createdBy          User           @relation("InvoiceCreatedBy", fields: [createdById], references: [id], onDelete: Restrict)
+  issueDate          DateTime       @map("issue_date") @db.Date
+  dueDate            DateTime       @map("due_date") @db.Date
+  currency           String
+  subtotalCents      Int            @map("subtotal_cents")
+  taxCents           Int            @map("tax_cents")
+  totalCents         Int            @map("total_cents")
+  taxRateBasisPoints Int            @default(1900) @map("tax_rate_basis_points")
+  issuerName         String         @map("issuer_name")
+  recipientName      String         @map("recipient_name")
+  recipientAddress   String         @map("recipient_address")
+  recipientContact   String?        @map("recipient_contact")
+  introText          String?        @map("intro_text")
+  closingText        String?        @map("closing_text")
+  internalNote       String?        @map("internal_note")
+  customerNote       String?        @map("customer_note")
+  sentAt             DateTime?      @map("sent_at")
+  paidAt             DateTime?      @map("paid_at")
+  cancelledAt        DateTime?      @map("cancelled_at")
+  version            Int            @default(1)
+  createdAt          DateTime       @default(now()) @map("created_at")
+  updatedAt          DateTime       @updatedAt @map("updated_at")
+  deletedAt          DateTime?      @map("deleted_at")
+  items              InvoiceItem[]
+  emails             EmailMessage[]
+  activities         Activity[]
+
+  @@index([quoteId])
+  @@index([companyId])
+  @@index([contactId])
+  @@index([dealId])
+  @@index([assignedUserId])
+  @@index([deletedAt, status])
+  @@index([issueDate])
+  @@index([dueDate])
+  @@index([updatedAt])
+  @@index([paidAt])
+  @@map("invoices")
+}
+
+model InvoiceItem {
+  id                 String   @id @default(cuid())
+  invoiceId          String   @map("invoice_id")
+  invoice            Invoice  @relation(fields: [invoiceId], references: [id], onDelete: Cascade)
+  position           Int
+  title              String
+  description        String?
+  // Thousandths: 1500 = 1.5 units. Money calculations use BigInt intermediates.
+  quantity           Int
+  unit               String
+  unitPriceCents     Int      @map("unit_price_cents")
+  taxRateBasisPoints Int      @map("tax_rate_basis_points")
+  lineSubtotalCents  Int      @map("line_subtotal_cents")
+  lineTaxCents       Int      @map("line_tax_cents")
+  lineTotalCents     Int      @map("line_total_cents")
+  createdAt          DateTime @default(now()) @map("created_at")
+  updatedAt          DateTime @updatedAt @map("updated_at")
+
+  @@unique([invoiceId, position])
+  @@map("invoice_items")
+}
+
+// Phase 14: regelbasierte interne Erinnerungen (keine KI, keine Kundenmails).
+enum ReminderType {
+  QUOTE_OPEN
+  DEAL_INACTIVE
+  FOLLOW_UP_DUE
+  TASK_OVERDUE
+  INVOICE_OVERDUE
+
+  @@map("reminder_type")
+}
+
+// PENDING: erzeugt, Mail noch nicht gesendet. SENDING: von genau einem Job
+// beansprucht (wird nach Absturz NIE automatisch erneut gesendet). SENT:
+// interne Mail zugestellt. FAILED: SMTP-Fehler, wird begrenzt erneut versucht.
+// NO_ASSIGNEE / INACTIVE_ASSIGNEE: nur im CRM sichtbar, keine Mail.
+// RESOLVED: Zustand erledigt oder manuell geschlossen.
+enum ReminderStatus {
+  PENDING
+  SENDING
+  SENT
+  FAILED
+  NO_ASSIGNEE
+  INACTIVE_ASSIGNEE
+  RESOLVED
+
+  @@map("reminder_status")
+}
+
+// Bewusst mehrere nullable FKs statt polymorpher entityType/entityId-Paare:
+// echte Fremdschlüssel (Integrität, Joins ohne N+1) - genau einer ist gesetzt
+// (CHECK num_nonnulls = 1 in der Migration). dedupeKey = Typ:Entität:Zustand
+// und UNIQUE: derselbe Zustand erzeugt nie zweimal eine Erinnerung/Mail,
+// auch bei parallelen Jobs oder Neustarts.
+model Reminder {
+  id             String         @id @default(cuid())
+  type           ReminderType
+  status         ReminderStatus @default(PENDING)
+  dedupeKey      String         @unique @map("dedupe_key")
+  assignedUserId String?        @map("assigned_user_id")
+  assignedUser   User?          @relation(fields: [assignedUserId], references: [id], onDelete: SetNull)
+  quoteId        String?        @map("quote_id")
+  quote          Quote?         @relation(fields: [quoteId], references: [id], onDelete: Cascade)
+  dealId         String?        @map("deal_id")
+  deal           Deal?          @relation(fields: [dealId], references: [id], onDelete: Cascade)
+  leadId         String?        @map("lead_id")
+  lead           Lead?          @relation(fields: [leadId], references: [id], onDelete: Cascade)
+  taskId         String?        @map("task_id")
+  task           Task?          @relation(fields: [taskId], references: [id], onDelete: Cascade)
+  invoiceId      String?        @map("invoice_id")
+  invoice        Invoice?       @relation(fields: [invoiceId], references: [id], onDelete: Cascade)
+  triggeredAt    DateTime       @default(now()) @map("triggered_at")
+  emailSentAt    DateTime?      @map("email_sent_at")
+  resolvedAt     DateTime?      @map("resolved_at")
+  attempts       Int            @default(0)
+  lastError      String?        @map("last_error")
+  createdAt      DateTime       @default(now()) @map("created_at")
+  updatedAt      DateTime       @updatedAt @map("updated_at")
+
+  @@index([status, type])
+  @@index([assignedUserId, status])
+  @@map("reminders")
+}
+
+// Singleton wie SystemSettings. Standardmäßig ALLES deaktiviert: beim ersten
+// Deployment existiert ein Rückstau überfälliger Vorgänge; der OWNER schaltet
+// die Erinnerungen bewusst ein, nachdem SMTP und Timer geprüft sind.
+model ReminderSettings {
+  id              String   @id @default(cuid())
+  singleton       Boolean  @unique @default(true)
+  quoteEnabled    Boolean  @default(false) @map("quote_enabled")
+  quoteDays       Int      @default(7) @map("quote_days")
+  dealEnabled     Boolean  @default(false) @map("deal_enabled")
+  dealDays        Int      @default(14) @map("deal_days")
+  followUpEnabled Boolean  @default(false) @map("follow_up_enabled")
+  taskEnabled     Boolean  @default(false) @map("task_enabled")
+  invoiceEnabled  Boolean  @default(false) @map("invoice_enabled")
+  createdAt       DateTime @default(now()) @map("created_at")
+  updatedAt       DateTime @updatedAt @map("updated_at")
+
+  @@map("reminder_settings")
+}
+
+// Phase 15: Dateien in der Kundenakte. Inhalt liegt NICHT in der Datenbank,
+// sondern im privaten Upload-Verzeichnis (CRM_UPLOAD_DIR) unter dem zufälligen
+// storedName. Genau ein Ziel (echte FKs, CHECK in der Migration). Löschen =
+// Soft Delete der Metadaten + physisches Entfernen der Datei.
+model FileAttachment {
+  id               String    @id @default(cuid())
+  originalName     String    @map("original_name")
+  storedName       String    @unique @map("stored_name")
+  mimeType         String    @map("mime_type")
+  sizeBytes        Int       @map("size_bytes")
+  uploadedByUserId String    @map("uploaded_by_user_id")
+  uploadedBy       User      @relation("FileUploader", fields: [uploadedByUserId], references: [id], onDelete: Restrict)
+  companyId        String?   @map("company_id")
+  company          Company?  @relation(fields: [companyId], references: [id], onDelete: Restrict)
+  contactId        String?   @map("contact_id")
+  contact          Contact?  @relation(fields: [contactId], references: [id], onDelete: Restrict)
+  dealId           String?   @map("deal_id")
+  deal             Deal?     @relation(fields: [dealId], references: [id], onDelete: Restrict)
+  createdAt        DateTime  @default(now()) @map("created_at")
+  deletedAt        DateTime? @map("deleted_at")
+
+  @@index([companyId, deletedAt])
+  @@index([contactId, deletedAt])
+  @@index([dealId, deletedAt])
+  @@map("file_attachments")
+}

@@ -1,0 +1,24 @@
+title = "CRM portfolio narrow false-positive allowlists"
+
+[extend]
+useDefault = true
+
+# Local code symbol is not a LinkedIn OAuth client ID.
+[[rules]]
+id = "linkedin-client-id"
+  [[rules.allowlists]]
+  description = "Import of local LinkedIn URL normalizer in exactly two files"
+  condition = "AND"
+  paths = ['''^src/modules/contacts/(actions|duplicate-detection)\.ts$''']
+  regexTarget = "match"
+  regexes = ['''normalizeLinkedinUrl''']
+
+# This UUID is a deterministic idempotency fixture, not an API key.
+[[rules]]
+id = "generic-api-key"
+  [[rules.allowlists]]
+  description = "One reviewed non-secret idempotency fixture in a unit test"
+  condition = "AND"
+  paths = ['''^tests/unit/invoices\.test\.ts$''']
+  regexTarget = "line"
+  regexes = ['''^\s*idempotencyKey: "b1255cb3-d410-4ed1-a900-630903ffb421",\s*$''']

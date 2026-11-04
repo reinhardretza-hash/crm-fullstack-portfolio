@@ -1,0 +1,126 @@
+name: CRM release verification
+
+on:
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  secrets:
+    name: Secret scan (GitHub snapshot)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Scan entire new Git history and working files using Gitleaks CLI
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION=8.24.3
+          BASE="https://github.com/zricethezav/gitleaks/releases/download/v${VERSION}"
+          curl --fail --location --retry 3 --silent --show-error -o /tmp/gitleaks.tar.gz "${BASE}/gitleaks_${VERSION}_linux_x64.tar.gz"
+          curl --fail --location --retry 3 --silent --show-error -o /tmp/gitleaks.sha256 "${BASE}/gitleaks_${VERSION}_checksums.txt"
+          grep "gitleaks_${VERSION}_linux_x64.tar.gz" /tmp/gitleaks.sha256 | sed "s#  gitleaks_${VERSION}_linux_x64.tar.gz#  /tmp/gitleaks.tar.gz#" | sha256sum -c -
+          tar xzf /tmp/gitleaks.tar.gz -C /tmp gitleaks
+          set +e
+          /tmp/gitleaks git --redact --report-format json --report-path /tmp/git-leak-findings.json --log-opts="--all" .
+          GIT_SCAN_STATUS=$?
+          /tmp/gitleaks dir --redact --report-format json --report-path /tmp/dir-leak-findings.json .
+          DIR_SCAN_STATUS=$?
+          set -e
+          node - <<'NODE'
+          const fs = require('node:fs');
+          for (const [name, location] of [['git', '/tmp/git-leak-findings.json'], ['files', '/tmp/dir-leak-findings.json']]) {
+            if (!fs.existsSync(location)) { console.log(name + ': no JSON report'); continue; }
+            const findings = JSON.parse(fs.readFileSync(location, 'utf8'));
+            console.log(name + ': ' + findings.length + ' potential findings');
+            for (const f of findings.slice(0, 30)) {
+              // Intentionally do NOT print secret values, snippets or commit diffs.
+              console.log(JSON.stringify({file:f.File, line:f.StartLine, rule:f.RuleID, commit:f.Commit?.slice(0,9)}));
+            }
+          }
+          NODE
+          if [ "$GIT_SCAN_STATUS" -ne 0 ] || [ "$DIR_SCAN_STATUS" -ne 0 ]; then
+            echo "::error::Gitleaks detected suspicious values or was unable to complete. Review masked file/line indicators."
+            exit 1
+          fi
+
+  dependencies-and-licenses:
+    name: Dependency security and SPDX review
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: npm
+      - run: npm ci
+      - name: Review unexpected personal data in tracked code
+        run: node scripts/audit-public-content.mjs
+      - name: npm audit (high and critical must fail)
+        run: npm audit --audit-level=high
+      - name: License inventory (manual follow-up required)
+        shell: bash
+        run: |
+          node <<'NODE'
+          const lock = require('./package-lock.json');
+          const packages = Object.entries(lock.packages || {}).filter(([name]) => name);
+          const missing = packages.filter(([name, data]) => !data.license).map(([name]) => name);
+          const complex = packages.filter(([name, data]) =>
+            /(?:LGPL|GPL|AGPL|MPL|EPL|CC-BY)/i.test(data.license || '')
+          ).map(([name, data]) => ({ name, license: data.license }));
+          console.log('Dependency entries:', packages.length);
+          console.log('Packages without license field:', missing);
+          console.log('Packages requiring license obligations review:', complex);
+          const documented = new Set(['node_modules/png-js']);
+          const unresolved = missing.filter(name => !documented.has(name));
+          if (missing.includes('node_modules/png-js')) {
+            const pkg = lock.packages['node_modules/png-js'];
+            if (pkg.version !== '2.0.0') unresolved.push('node_modules/png-js (version changed)');
+            console.log('png-js 2.0.0 MIT license verified from upstream source; see THIRD_PARTY_NOTICES.md.');
+          }
+          if (unresolved.length) {
+            console.error('Unresolved missing license metadata:', unresolved);
+            process.exitCode = 1;
+          }
+          NODE
+
+  integration:
+    name: Quality and isolated PostgreSQL integration tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: crm_ci
+          POSTGRES_PASSWORD: ephemeral-ci-only-db-password
+          POSTGRES_DB: crm_portfolio_test
+        options: >-
+          --health-cmd="pg_isready -U crm_ci -d crm_portfolio_test"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=5
+        ports:
+          - 5432:5432
+    env:
+      DATABASE_URL: postgresql://crm_ci:ephemeral-ci-only-db-password@localhost:5432/crm_portfolio_test?schema=public
+      TEST_DATABASE_URL: postgresql://crm_ci:ephemeral-ci-only-db-password@localhost:5432/crm_portfolio_test?schema=public
+      AUTH_SECRET: only-ci-test-credential-this-is-not-a-live-secret-123456
+      LOGIN_RATE_LIMIT_SECRET: only-ci-rate-limit-this-is-not-a-live-secret-123456
+      AUTH_URL: http://localhost:3000
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: npm
+      - run: npm ci
+      - run: npx prisma generate
+      - run: npx prisma migrate deploy
+      - run: npm run quality
+      - run: npm run test:integration

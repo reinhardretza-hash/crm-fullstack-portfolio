@@ -1,0 +1,4 @@
+// Kleine Singular/Plural-Helfer für Zähltexte (Deutsch), z. B. "1 offener Deal".
+export function pluralize(count: number, singular: string, plural: string): string {
+  return `${count} ${count === 1 ? singular : plural}`;
+}

@@ -1,0 +1,17 @@
+# Nur für lokale Entwicklung. Produktion läuft direkt auf dem Ubuntu-VPS,
+# die Anwendung selbst hat keine Docker-Abhängigkeit.
+services:
+  postgres:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: rdevolution
+      POSTGRES_PASSWORD: ${CRM_DEV_DB_PASSWORD:?Setze CRM_DEV_DB_PASSWORD in deiner lokalen .env oder Shell}
+      POSTGRES_DB: rdevolution_crm_dev
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - rdevolution_crm_dev_data:/var/lib/postgresql/data
+
+volumes:
+  rdevolution_crm_dev_data:
