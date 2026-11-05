@@ -1,5 +1,5 @@
 import { chromium } from "playwright";
-const browser = await chromium.launch({headless:true});
+const browser = await chromium.launch({headless:true,executablePath:"/usr/bin/google-chrome",args:["--no-sandbox","--disable-dev-shm-usage"]});
 const page = await browser.newPage({
   viewport:{width:1600,height:900},deviceScaleFactor:1,
   locale:"de-DE",timezoneId:"Europe/Berlin"
