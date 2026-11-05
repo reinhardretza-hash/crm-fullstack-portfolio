@@ -1,0 +1,95 @@
+name: Capture actual CRM dashboard with fictional records
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'scripts/portfolio-screenshot-*'
+      - '.github/workflows/portfolio-screenshot.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  screenshot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: demo_runner
+          POSTGRES_PASSWORD: ci-only-ephemeral-test-password
+          POSTGRES_DB: crm_screenshot_test
+        options: >-
+          --health-cmd="pg_isready -U demo_runner -d crm_screenshot_test"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=5
+        ports:
+          - 5432:5432
+    env:
+      DATABASE_URL: postgresql://demo_runner:ci-only-ephemeral-test-password@localhost:5432/crm_screenshot_test?schema=public
+      AUTH_URL: http://127.0.0.1:3000
+      NEXTAUTH_URL: http://127.0.0.1:3000
+      AUTH_TRUST_HOST: "true"
+      AUTH_SECRET: isolated-ci-demo-auth-secret-32-chars-long
+      LOGIN_RATE_LIMIT_SECRET: isolated-ci-demo-rate-limit-secret-32-chars-long
+      INITIAL_OWNER_EMAIL: demo@example.invalid
+      INITIAL_OWNER_PASSWORD: Portfolio-Screenshot-Demo-2026-NoLiveAccount!
+      INITIAL_OWNER_FIRST_NAME: Demo
+      INITIAL_OWNER_LAST_NAME: Benutzer
+      NEXT_TELEMETRY_DISABLED: "1"
+    steps:
+      - name: Checkout code (never production credentials)
+        uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: npm
+      - name: Install project dependencies
+        run: npm ci
+      - name: Generate Prisma client and migrate isolated test database
+        run: |
+          npx prisma generate
+          npx prisma migrate deploy
+      - name: Seed isolated example account and fictional CRM records
+        run: |
+          npm run db:seed
+          npx tsx scripts/portfolio-screenshot-seed.mjs
+      - name: Install browser automation for screenshot only
+        run: |
+          npm install --no-save --package-lock=false playwright@1.56.0
+          npx playwright install --with-deps chromium
+      - name: Start real CRM on localhost
+        run: |
+          npm run dev > /tmp/crm-demo-server.log 2>&1 &
+          echo $! > /tmp/crm-demo-server.pid
+          for i in $(seq 1 90); do
+            if curl --fail --silent --output /dev/null http://127.0.0.1:3000/login; then
+              echo "CRM login page is accessible."
+              exit 0
+            fi
+            sleep 2
+          done
+          tail -80 /tmp/crm-demo-server.log
+          exit 1
+      - name: Capture authentic dashboard
+        run: node scripts/portfolio-screenshot-capture.mjs
+      - name: Upload web-ready dashboard screenshots
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: crm-real-dashboard-screenshot
+          path: |
+            crm-dashboard-1600x900.png
+            crm-dashboard-full.png
+            crm-dashboard-portfolio.webp
+          if-no-files-found: warn
+          retention-days: 30
+      - name: Report app start errors without secrets
+        if: failure()
+        run: |
+          if [ -f /tmp/crm-demo-server.log ]; then
+            tail -30 /tmp/crm-demo-server.log | sed -E 's/(PASSWORD|SECRET|TOKEN|KEY)=\S+/\1=[REDACTED]/g'
+          fi
