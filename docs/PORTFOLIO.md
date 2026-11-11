@@ -34,6 +34,6 @@ Unternehmen und Kontakte, Leads und Vertriebspipelines, Deals, Aufgaben und Foll
 
 Die fachliche Logik befindet sich unter `src/modules`, PostgreSQL-Schema und Migrationen unter `prisma`, automatisierte Tests unter `tests`. Lokaler Start und Prüfkommandos sind in der [README](../README.md) dokumentiert.
 
-**Hinweis:** Die Veröffentlichungsversion wird aus einem separat geprüften Dateistand mit neuer Git-Historie erstellt. Tests und Sicherheitsprüfungen sind vor Veröffentlichung erneut auszuführen.
+**Hinweis:** Diese öffentliche Portfolio-Version wurde mit einer neuen Git-Historie veröffentlicht. Sie dient der technischen Projektvorstellung und ist nicht für einen ungeprüften Produktivbetrieb freigegeben. Vor einem produktiven Einsatz sind erneute Tests und Sicherheitsprüfungen in der Zielumgebung erforderlich.
 
 *Stand: November 2026.*
