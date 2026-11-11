@@ -49,9 +49,9 @@ npm run test:integration
 
 - Echte Zugangsdaten gehören nur in lokale oder geschützte Umgebungsvariablen.
 - Beispiele in `.env.example` sind Platzhalter und keine Zugangsdaten.
-- Diese öffentliche Kopie soll **ohne die bisherige private Git-Historie** entstehen.
-- Die Quellcode- und Drittanbieter-Lizenzfragen sind unabhängig von der technischen Bereinigung zu klären.
-- Vor Veröffentlichung sind ein Secrets-Scan, eine Prüfung personenbezogener/geschäftlicher Daten, die Projekt-Tests und eine manuelle Codeprüfung erforderlich.
+- Diese öffentliche Portfolio-Kopie wurde mit neuer Git-Historie veröffentlicht; die frühere private Git-Historie ist nicht enthalten.
+- Fragen zu Quellcode- und Drittanbieter-Lizenzen sind unabhängig vom technischen Veröffentlichungsstand zu prüfen.
+- Die Veröffentlichung als Entwicklerportfolio ist keine Freigabe für den Produktivbetrieb. Vor einem produktiven Einsatz sind Prüfungen auf Geheimnisse und sensible Daten, Projekt-Tests sowie eine manuelle Sicherheitsprüfung erforderlich.
 
 **Autor:** Reinhard Wesali Retza · [Portfolio](https://reinhardwesaliretza.de)
 
